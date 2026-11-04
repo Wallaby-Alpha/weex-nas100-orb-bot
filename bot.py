@@ -59,10 +59,10 @@ def load_config() -> Dict[str, Any]:
         "secret_key": os.environ.get("WEEX_SECRET_KEY", ""),
         "passphrase": os.environ.get("WEEX_PASSPHRASE", ""),
         "dry_run": False,
-        "symbol": "NAS100USDT",
+        "symbol": "QQQUSDT",
         "risk_usd": 1.0,
-        "stop_loss_points": 25.0,
-        "take_profit_points": 50.0,
+        "stop_loss_points": 1.0,
+        "take_profit_points": 2.0,
         "trade_asia": True,
         "trade_ny": True,
         "poll_interval_seconds": 5,
@@ -514,6 +514,13 @@ class OrbTradingBot:
                     f"• <b>Time:</b> {now_ny.strftime('%H:%M:%S')} ET"
                 )
                 self.notify(msg)
+            else:
+                logger.error(f"Long order failed: {order_res}. Marking session locked.")
+                if "session_trades" not in self.state:
+                    self.state["session_trades"] = {}
+                self.state["session_trades"][session_key] = True
+                self._save_state()
+                self.notify(f"⚠️ <b>WEEX Order Failed for {self.symbol}</b>: <code>{order_res.get('error', 'Rejected')}</code>")
 
         # Short Breakdown
         elif current_price <= orb["low"]:
@@ -549,6 +556,13 @@ class OrbTradingBot:
                     f"• <b>Time:</b> {now_ny.strftime('%H:%M:%S')} ET"
                 )
                 self.notify(msg)
+            else:
+                logger.error(f"Short order failed: {order_res}. Marking session locked.")
+                if "session_trades" not in self.state:
+                    self.state["session_trades"] = {}
+                self.state["session_trades"][session_key] = True
+                self._save_state()
+                self.notify(f"⚠️ <b>WEEX Order Failed for {self.symbol}</b>: <code>{order_res.get('error', 'Rejected')}</code>")
 
     def _manage_active_trade(self, curr_time: dtime, today_str: str, now_ny: datetime):
         active = self.state.get("active_trade")
