@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+config.json
+orb_state.json
+weex_nas100_orb.log
+*.log
+.pytest_cache/
+venv/

@@ -1,0 +1,17 @@
+{
+  "api_key": "",
+  "secret_key": "",
+  "passphrase": "",
+  "dry_run": false,
+  "symbol": "NAS100USDT",
+  "risk_usd": 1.0,
+  "stop_loss_points": 25.0,
+  "take_profit_points": 50.0,
+  "opening_range_minutes": 15,
+  "market_open_hour_ny": 9,
+  "market_open_minute_ny": 30,
+  "eod_close_hour_ny": 15,
+  "eod_close_minute_ny": 55,
+  "telegram_bot_token": "",
+  "telegram_chat_id": ""
+}
