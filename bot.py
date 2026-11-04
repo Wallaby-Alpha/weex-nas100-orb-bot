@@ -1,28 +1,15 @@
 """
 weex-nas100-orb-bot / bot.py
 ----------------------------
-Production 15-Minute Opening Range Breakout (ORB) Trading Bot for WEEX NAS100USDT.
-Designed for deployment on a DigitalOcean Droplet ($1 micro-risk live forward testing).
+Dual-Session 15-Minute Opening Range Breakout (ORB) Bot for WEEX NAS100USDT.
+Trades both:
+1. Asia Session Open:     20:00 ET (Range: 20:00 to 20:15 ET, monitoring until 02:00 ET)
+2. New York Session Open: 09:30 ET (Range: 09:30 to 09:45 ET, monitoring until 15:55 ET)
 
-Core Strategy & Execution Architecture:
-1. Exact Micro-Risk Sizing ($1.00 USD risk):
-   - Computes dynamic or fixed contract quantity to risk EXACTLY $1.00 on a 25-point stop loss.
-   - Sizing formula: Qty = Risk ($1.00) / (Stop Distance * ContractVal).
-   - On WEEX NAS100USDT (ContractVal = 0.0001, 1 pt change on 1.0 contract = $1.00 USDT PnL):
-     Qty = 1.00 / 25.0 = 0.0400 contracts.
-2. Opening Range (OR) Calculation:
-   - Evaluates closed 1m or 15m candles during 09:30 AM – 09:45 AM America/New_York.
-   - Determines OR High and OR Low.
-3. Execution Trigger:
-   - At 09:45 AM ET, monitors breakout of OR High (Long) or breakdown of OR Low (Short).
-   - Only ONE trade taken per calendar day (strictly preventing overtrading).
-4. Dual Invalidation & Profit Target:
-   - Stop Loss: Fixed 25 points ($1.00 loss).
-   - Take Profit: Fixed 50 points (2.0R = +$2.00 gain).
-   - EOD Time Stop: At 15:55 PM ET, closes open market position if neither SL nor TP triggered.
-5. Exchange-Native Orders & Telegram Broadcasts:
-   - Directly places market entry with SL & TP brackets to WEEX matching engine.
-   - Dispatches formatted Telegram alerts at: Range Set, Entry Filled, Exit Triggered, and Daily Summary.
+Core Features:
+- Exact Micro-Risk Sizing: Risks strictly $1.00 USD on WEEX per trade.
+- Real-Time Prop Firm Shadow Tracking: Simulates 2 MNQ ($100 risk) on MFF Flex 25K rules.
+- Real-Time Telegram Broadcasts with session tags, fill confirmations, and prop firm equity meters.
 """
 
 import os
@@ -41,7 +28,7 @@ import pandas as pd
 import pytz
 from prop_tracker import PropFirmTracker
 
-# Ensure UTF-8 output on all operating systems
+# Ensure UTF-8 output
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -76,11 +63,8 @@ def load_config() -> Dict[str, Any]:
         "risk_usd": 1.0,
         "stop_loss_points": 25.0,
         "take_profit_points": 50.0,
-        "opening_range_minutes": 15,
-        "market_open_hour_ny": 9,
-        "market_open_minute_ny": 30,
-        "eod_close_hour_ny": 15,
-        "eod_close_minute_ny": 55,
+        "trade_asia": True,
+        "trade_ny": True,
         "poll_interval_seconds": 5,
         "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -120,7 +104,6 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 
 
 class WeexClient:
-    """Production client for WEEX V3 Contract API."""
     def __init__(self, api_key: str, secret_key: str, passphrase: str, dry_run: bool = False):
         self.base_url = "https://api-contract.weex.com"
         self.api_key = api_key
@@ -204,11 +187,6 @@ class WeexClient:
         return None
 
     def calculate_micro_qty(self, symbol: str, risk_usd: float, stop_points: float) -> Tuple[float, str]:
-        """
-        Calculates position quantity to achieve strict micro-risk (e.g. $1.00 USD).
-        On WEEX NAS100USDT: 1 unit change in price = 1.0 USDT per 1.0 contract.
-        Quantity = Risk / StopPoints.
-        """
         info = self.exchange_info.get(symbol, {
             "pricePrecision": 2,
             "quantityPrecision": 4,
@@ -226,16 +204,13 @@ class WeexClient:
     def place_order_with_brackets(
         self,
         symbol: str,
-        side: str,           # "BUY" or "SELL"
-        position_side: str,  # "LONG" or "SHORT"
+        side: str,
+        position_side: str,
         quantity: float,
         stop_loss: float,
         take_profit: float
     ) -> Dict[str, Any]:
-        info = self.exchange_info.get(symbol, {
-            "pricePrecision": 2,
-            "quantityPrecision": 4
-        })
+        info = self.exchange_info.get(symbol, {"pricePrecision": 2, "quantityPrecision": 4})
         p_prec = info.get("pricePrecision", 2)
         q_prec = info.get("quantityPrecision", 4)
 
@@ -291,7 +266,6 @@ class WeexClient:
             return {"status": "error", "error": str(e)}
 
     def close_position_market(self, symbol: str, position_side: str, quantity: float) -> Dict[str, Any]:
-        """Closes open long or short position via counter market order."""
         side = "SELL" if position_side.upper() == "LONG" else "BUY"
         info = self.exchange_info.get(symbol, {"quantityPrecision": 4})
         qty_str = f"{quantity:.{info.get('quantityPrecision', 4)}f}"
@@ -359,8 +333,8 @@ class OrbTradingBot:
                 logger.warning(f"Error loading state: {e}")
         return {
             "active_trade": None,
-            "last_trade_date": "",
-            "opening_range": None
+            "session_trades": {},  # "YYYY-MM-DD_ASIA": True, "YYYY-MM-DD_NY": True
+            "current_session_orb": None
         }
 
     def _save_state(self):
@@ -378,36 +352,33 @@ class OrbTradingBot:
             message
         )
 
-    def calculate_opening_range(self) -> Optional[Dict[str, float]]:
-        """
-        Fetches 1m klines from 09:30 to 09:45 AM ET to calculate High & Low.
-        """
-        df = self.client.get_klines(self.symbol, interval="1m", limit=35)
+    def calculate_opening_range(self, start_h: int, start_m: int, end_h: int, end_m: int) -> Optional[Dict[str, float]]:
+        """Calculates OR High and Low between start and end time (NY timezone)."""
+        df = self.client.get_klines(self.symbol, interval="1m", limit=40)
         if df is None or len(df) < 15:
-            logger.warning("Insufficient 1m klines fetched for ORB calculation.")
             return None
 
-        # Convert open_time to NY timezone
         df["time_ny"] = df["open_time"].dt.tz_convert(NY_TZ)
         today_date = datetime.now(NY_TZ).date()
 
-        # Filter strictly for today between 09:30:00 and 09:44:59
+        t_start = dtime(start_h, start_m)
+        t_end = dtime(end_h, end_m)
+
         mask = (
             (df["time_ny"].dt.date == today_date) &
-            (df["time_ny"].dt.time >= dtime(9, 30)) &
-            (df["time_ny"].dt.time < dtime(9, 45))
+            (df["time_ny"].dt.time >= t_start) &
+            (df["time_ny"].dt.time < t_end)
         )
         or_df = df[mask]
         if len(or_df) < 10:
-            logger.warning(f"Expected >=10 bars in 15m window, found {len(or_df)} bars.")
             return None
 
-        or_high = float(or_df["high"].max())
-        or_low = float(or_df["low"].min())
+        or_h = float(or_df["high"].max())
+        or_l = float(or_df["low"].min())
         return {
-            "high": or_high,
-            "low": or_low,
-            "range": round(or_high - or_low, 2)
+            "high": or_h,
+            "low": or_l,
+            "range": round(or_h - or_l, 2)
         }
 
     def run_cycle(self):
@@ -415,206 +386,237 @@ class OrbTradingBot:
         today_str = now_ny.strftime("%Y-%m-%d")
         curr_time = now_ny.time()
 
-        # 1. Reset daily state at 09:00 AM NY
-        if curr_time < dtime(9, 29):
-            if self.state.get("last_trade_date") != today_str and self.state.get("opening_range") is not None:
-                self.state["opening_range"] = None
-                self._save_state()
+        # =====================================================================
+        # 1. ASIA SESSION (20:00 to 02:00 ET)
+        # =====================================================================
+        if self.cfg.get("trade_asia", True):
+            asia_session_key = f"{today_str}_ASIA"
+            # Establish Asia OR at 20:15 ET (20:00:00 to 20:14:59 ET)
+            if dtime(20, 15) <= curr_time < dtime(20, 16):
+                orb_info = self.state.get("current_session_orb")
+                if not orb_info or orb_info.get("session") != "ASIA":
+                    orb = self.calculate_opening_range(20, 0, 20, 15)
+                    if orb:
+                        self.state["current_session_orb"] = {"session": "ASIA", "orb": orb, "date": today_str}
+                        self._save_state()
+                        qty, qty_str = self.client.calculate_micro_qty(self.symbol, self.risk_usd, self.stop_pts)
+                        msg = (
+                            f"🌏 <b>WEEX {self.symbol} ASIA 15m Range Established</b>\n"
+                            f"• <b>Session:</b> Tokyo / Asia Open (20:00 ET)\n"
+                            f"• <b>OR High:</b> <code>{orb['high']:.2f}</code>\n"
+                            f"• <b>OR Low:</b> <code>{orb['low']:.2f}</code> (Span: <code>{orb['range']:.2f} pts</code>)\n"
+                            f"• <b>Target Risk:</b> <code>${self.risk_usd:.2f}</code> (Qty: <code>{qty_str}</code>)\n"
+                            f"• <b>SL / TP:</b> <code>25 pts / 50 pts (2.0R)</code>\n"
+                            f"<i>Scanning Asia session for breakout...</i>"
+                        )
+                        self.notify(msg)
+
+            # Check Asia Session Breakout trigger (20:15 ET to 02:00 ET)
+            orb_info = self.state.get("current_session_orb")
+            if orb_info and orb_info.get("session") == "ASIA" and not self.state.get("session_trades", {}).get(asia_session_key) and self.state.get("active_trade") is None:
+                if (curr_time >= dtime(20, 15) or curr_time < dtime(2, 0)):
+                    self._check_and_execute_breakout("ASIA", asia_session_key, orb_info["orb"], now_ny)
+
+        # =====================================================================
+        # 2. NEW YORK SESSION (09:30 to 15:55 ET)
+        # =====================================================================
+        if self.cfg.get("trade_ny", True):
+            ny_session_key = f"{today_str}_NY"
+            # Establish NY OR at 09:45 ET (09:30:00 to 09:44:59 ET)
+            if dtime(9, 45) <= curr_time < dtime(9, 46):
+                orb_info = self.state.get("current_session_orb")
+                if not orb_info or orb_info.get("session") != "NY":
+                    orb = self.calculate_opening_range(9, 30, 9, 45)
+                    if orb:
+                        self.state["current_session_orb"] = {"session": "NY", "orb": orb, "date": today_str}
+                        self._save_state()
+                        qty, qty_str = self.client.calculate_micro_qty(self.symbol, self.risk_usd, self.stop_pts)
+                        msg = (
+                            f"🗽 <b>WEEX {self.symbol} NY 15m Range Established</b>\n"
+                            f"• <b>Session:</b> New York Cash Open (09:30 ET)\n"
+                            f"• <b>OR High:</b> <code>{orb['high']:.2f}</code>\n"
+                            f"• <b>OR Low:</b> <code>{orb['low']:.2f}</code> (Span: <code>{orb['range']:.2f} pts</code>)\n"
+                            f"• <b>Target Risk:</b> <code>${self.risk_usd:.2f}</code> (Qty: <code>{qty_str}</code>)\n"
+                            f"• <b>SL / TP:</b> <code>25 pts / 50 pts (2.0R)</code>\n"
+                            f"<i>Scanning NY session for breakout...</i>"
+                        )
+                        self.notify(msg)
+
+            # Check NY Session Breakout trigger (09:45 ET to 15:00 ET)
+            orb_info = self.state.get("current_session_orb")
+            if orb_info and orb_info.get("session") == "NY" and not self.state.get("session_trades", {}).get(ny_session_key) and self.state.get("active_trade") is None:
+                if dtime(9, 45) <= curr_time <= dtime(15, 0):
+                    self._check_and_execute_breakout("NY", ny_session_key, orb_info["orb"], now_ny)
+
+        # =====================================================================
+        # 3. POSITION MANAGEMENT (Take Profit, Stop Loss, or Session End)
+        # =====================================================================
+        self._manage_active_trade(curr_time, today_str, now_ny)
+
+    def _check_and_execute_breakout(self, session_tag: str, session_key: str, orb: Dict[str, float], now_ny: datetime):
+        current_price = self.client.get_latest_price(self.symbol)
+        if current_price is None:
             return
 
-        # 2. At 09:45 AM NY, establish the 15m Opening Range
-        if dtime(9, 45) <= curr_time < dtime(9, 46) and self.state.get("opening_range") is None:
-            orb = self.calculate_opening_range()
-            if orb:
-                self.state["opening_range"] = orb
+        qty, qty_str = self.client.calculate_micro_qty(self.symbol, self.risk_usd, self.stop_pts)
+
+        # Long Breakout
+        if current_price >= orb["high"]:
+            entry_p = current_price
+            sl = entry_p - self.stop_pts
+            tp = entry_p + self.target_pts
+            order_res = self.client.place_order_with_brackets(
+                symbol=self.symbol, side="BUY", position_side="LONG",
+                quantity=qty, stop_loss=sl, take_profit=tp
+            )
+            if order_res.get("status") in ["success", "dry_run_success"]:
+                self.state["active_trade"] = {
+                    "session": session_tag,
+                    "symbol": self.symbol,
+                    "side": "LONG",
+                    "entry_price": entry_p,
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "quantity": qty,
+                    "entry_time": now_ny.strftime("%H:%M:%S")
+                }
+                if "session_trades" not in self.state:
+                    self.state["session_trades"] = {}
+                self.state["session_trades"][session_key] = True
                 self._save_state()
-                qty, qty_str = self.client.calculate_micro_qty(self.symbol, self.risk_usd, self.stop_pts)
+                tag_icon = "🌏" if session_tag == "ASIA" else "🗽"
                 msg = (
-                    f"🎯 <b>WEEX {self.symbol} 15m Opening Range Set</b>\n"
-                    f"• <b>Date:</b> {today_str}\n"
-                    f"• <b>OR High:</b> <code>{orb['high']:.2f}</code>\n"
-                    f"• <b>OR Low:</b> <code>{orb['low']:.2f}</code>\n"
-                    f"• <b>Span:</b> <code>{orb['range']:.2f} pts</code>\n"
-                    f"• <b>Target Risk:</b> <code>${self.risk_usd:.2f}</code> (Qty: <code>{qty_str}</code> contracts)\n"
-                    f"• <b>SL / TP:</b> <code>25 pts / 50 pts (2.0R)</code>\n"
-                    f"<i>Armed and scanning for breakout...</i>"
+                    f"{tag_icon} <b>WEEX {self.symbol} [{session_tag}] LONG Fill</b>\n"
+                    f"• <b>Entry:</b> <code>{entry_p:.2f}</code>\n"
+                    f"• <b>Stop Loss:</b> <code>{sl:.2f}</code> (-${self.risk_usd:.2f})\n"
+                    f"• <b>Take Profit:</b> <code>{tp:.2f}</code> (+${self.risk_usd * 2:.2f} | 2R)\n"
+                    f"• <b>Position Size:</b> <code>{qty_str}</code> contracts\n"
+                    f"• <b>Time:</b> {now_ny.strftime('%H:%M:%S')} ET"
                 )
                 self.notify(msg)
 
-        # 3. Monitor active breakout triggers if no trade taken today
-        orb = self.state.get("opening_range")
-        if orb and self.state.get("last_trade_date") != today_str and self.state.get("active_trade") is None:
-            # Trade entry allowed between 09:45 AM and 15:00 PM NY
-            if dtime(9, 45) <= curr_time <= dtime(15, 0):
-                current_price = self.client.get_latest_price(self.symbol)
-                if current_price is None:
-                    return
+        # Short Breakdown
+        elif current_price <= orb["low"]:
+            entry_p = current_price
+            sl = entry_p + self.stop_pts
+            tp = entry_p - self.target_pts
+            order_res = self.client.place_order_with_brackets(
+                symbol=self.symbol, side="SELL", position_side="SHORT",
+                quantity=qty, stop_loss=sl, take_profit=tp
+            )
+            if order_res.get("status") in ["success", "dry_run_success"]:
+                self.state["active_trade"] = {
+                    "session": session_tag,
+                    "symbol": self.symbol,
+                    "side": "SHORT",
+                    "entry_price": entry_p,
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "quantity": qty,
+                    "entry_time": now_ny.strftime("%H:%M:%S")
+                }
+                if "session_trades" not in self.state:
+                    self.state["session_trades"] = {}
+                self.state["session_trades"][session_key] = True
+                self._save_state()
+                tag_icon = "🌏" if session_tag == "ASIA" else "🗽"
+                msg = (
+                    f"{tag_icon} <b>WEEX {self.symbol} [{session_tag}] SHORT Fill</b>\n"
+                    f"• <b>Entry:</b> <code>{entry_p:.2f}</code>\n"
+                    f"• <b>Stop Loss:</b> <code>{sl:.2f}</code> (-${self.risk_usd:.2f})\n"
+                    f"• <b>Take Profit:</b> <code>{tp:.2f}</code> (+${self.risk_usd * 2:.2f} | 2R)\n"
+                    f"• <b>Position Size:</b> <code>{qty_str}</code> contracts\n"
+                    f"• <b>Time:</b> {now_ny.strftime('%H:%M:%S')} ET"
+                )
+                self.notify(msg)
 
-                qty, qty_str = self.client.calculate_micro_qty(self.symbol, self.risk_usd, self.stop_pts)
-
-                # Bullish Breakout of OR High
-                if current_price >= orb["high"]:
-                    entry_p = current_price
-                    sl = entry_p - self.stop_pts
-                    tp = entry_p + self.target_pts
-                    order_res = self.client.place_order_with_brackets(
-                        symbol=self.symbol,
-                        side="BUY",
-                        position_side="LONG",
-                        quantity=qty,
-                        stop_loss=sl,
-                        take_profit=tp
-                    )
-                    if order_res.get("status") in ["success", "dry_run_success"]:
-                        self.state["active_trade"] = {
-                            "symbol": self.symbol,
-                            "side": "LONG",
-                            "entry_price": entry_p,
-                            "stop_loss": sl,
-                            "take_profit": tp,
-                            "quantity": qty,
-                            "entry_time": now_ny.strftime("%H:%M:%S")
-                        }
-                        self.state["last_trade_date"] = today_str
-                        self._save_state()
-                        msg = (
-                            f"🚀 <b>WEEX {self.symbol} LONG Fill</b>\n"
-                            f"• <b>Entry:</b> <code>{entry_p:.2f}</code>\n"
-                            f"• <b>Stop Loss:</b> <code>{sl:.2f}</code> (-${self.risk_usd:.2f})\n"
-                            f"• <b>Take Profit:</b> <code>{tp:.2f}</code> (+${self.risk_usd * 2:.2f} | 2R)\n"
-                            f"• <b>Position Size:</b> <code>{qty_str}</code> contracts\n"
-                            f"• <b>Time:</b> {now_ny.strftime('%H:%M:%S')} ET"
-                        )
-                        self.notify(msg)
-
-                # Bearish Breakdown of OR Low
-                elif current_price <= orb["low"]:
-                    entry_p = current_price
-                    sl = entry_p + self.stop_pts
-                    tp = entry_p - self.target_pts
-                    order_res = self.client.place_order_with_brackets(
-                        symbol=self.symbol,
-                        side="SELL",
-                        position_side="SHORT",
-                        quantity=qty,
-                        stop_loss=sl,
-                        take_profit=tp
-                    )
-                    if order_res.get("status") in ["success", "dry_run_success"]:
-                        self.state["active_trade"] = {
-                            "symbol": self.symbol,
-                            "side": "SHORT",
-                            "entry_price": entry_p,
-                            "stop_loss": sl,
-                            "take_profit": tp,
-                            "quantity": qty,
-                            "entry_time": now_ny.strftime("%H:%M:%S")
-                        }
-                        self.state["last_trade_date"] = today_str
-                        self._save_state()
-                        msg = (
-                            f"🔻 <b>WEEX {self.symbol} SHORT Fill</b>\n"
-                            f"• <b>Entry:</b> <code>{entry_p:.2f}</code>\n"
-                            f"• <b>Stop Loss:</b> <code>{sl:.2f}</code> (-${self.risk_usd:.2f})\n"
-                            f"• <b>Take Profit:</b> <code>{tp:.2f}</code> (+${self.risk_usd * 2:.2f} | 2R)\n"
-                            f"• <b>Position Size:</b> <code>{qty_str}</code> contracts\n"
-                            f"• <b>Time:</b> {now_ny.strftime('%H:%M:%S')} ET"
-                        )
-                        self.notify(msg)
-
-        # 4. Check active position status & EOD Close at 15:55 PM NY
+    def _manage_active_trade(self, curr_time: dtime, today_str: str, now_ny: datetime):
         active = self.state.get("active_trade")
-        if active:
-            current_price = self.client.get_latest_price(self.symbol)
-            if current_price:
-                # Target Hit Check
-                target_hit = (active["side"] == "LONG" and current_price >= active["take_profit"]) or \
-                             (active["side"] == "SHORT" and current_price <= active["take_profit"])
-                # Stop Hit Check
-                stop_hit = (active["side"] == "LONG" and current_price <= active["stop_loss"]) or \
-                           (active["side"] == "SHORT" and current_price >= active["stop_loss"])
+        if not active:
+            return
 
-                if target_hit:
-                    pnl_usd = self.risk_usd * 2.0
-                    pts = self.target_pts
-                    prop_res = self.prop_tracker.record_trade(
-                        date_str=today_str,
-                        side=active["side"],
-                        entry_price=active["entry_price"],
-                        exit_price=active["take_profit"],
-                        pts=pts,
-                        r_multiple=2.0,
-                        outcome="TARGET"
-                    )
-                    prop_box = self.prop_tracker.format_telegram_summary(prop_res)
-                    msg = (
-                        f"💰 <b>WEEX {self.symbol} TAKE PROFIT HIT (+2.0R)</b>\n"
-                        f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
-                        f"• <b>Live PnL ($1 Risk):</b> <code>+${pnl_usd:.2f}</code>\n"
-                        f"• <b>Outcome:</b> WIN"
-                        f"{prop_box}"
-                    )
-                    self.notify(msg)
-                    self.state["active_trade"] = None
-                    self._save_state()
+        current_price = self.client.get_latest_price(self.symbol)
+        if not current_price:
+            return
 
-                elif stop_hit:
-                    pnl_usd = -self.risk_usd
-                    pts = -self.stop_pts
-                    prop_res = self.prop_tracker.record_trade(
-                        date_str=today_str,
-                        side=active["side"],
-                        entry_price=active["entry_price"],
-                        exit_price=active["stop_loss"],
-                        pts=pts,
-                        r_multiple=-1.0,
-                        outcome="STOP"
-                    )
-                    prop_box = self.prop_tracker.format_telegram_summary(prop_res)
-                    msg = (
-                        f"🛑 <b>WEEX {self.symbol} STOP LOSS HIT (-1.0R)</b>\n"
-                        f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
-                        f"• <b>Live PnL ($1 Risk):</b> <code>-${self.risk_usd:.2f}</code>\n"
-                        f"• <b>Outcome:</b> LOSS"
-                        f"{prop_box}"
-                    )
-                    self.notify(msg)
-                    self.state["active_trade"] = None
-                    self._save_state()
+        session_tag = active.get("session", "NY")
+        target_hit = (active["side"] == "LONG" and current_price >= active["take_profit"]) or \
+                     (active["side"] == "SHORT" and current_price <= active["take_profit"])
+        stop_hit = (active["side"] == "LONG" and current_price <= active["stop_loss"]) or \
+                   (active["side"] == "SHORT" and current_price >= active["stop_loss"])
 
-                # EOD Close at 15:55 PM NY
-                elif curr_time >= dtime(self.cfg.get("eod_close_hour_ny", 15), self.cfg.get("eod_close_minute_ny", 55)):
-                    self.client.close_position_market(self.symbol, active["side"], active["quantity"])
-                    diff = (current_price - active["entry_price"]) if active["side"] == "LONG" else (active["entry_price"] - current_price)
-                    pnl_usd = round((diff / self.stop_pts) * self.risk_usd, 2)
-                    r_multiple = round(diff / self.stop_pts, 2)
-                    prop_res = self.prop_tracker.record_trade(
-                        date_str=today_str,
-                        side=active["side"],
-                        entry_price=active["entry_price"],
-                        exit_price=current_price,
-                        pts=diff,
-                        r_multiple=r_multiple,
-                        outcome="EOD"
-                    )
-                    prop_box = self.prop_tracker.format_telegram_summary(prop_res)
-                    msg = (
-                        f"⏱ <b>WEEX {self.symbol} EOD TIME STOP (15:55 ET)</b>\n"
-                        f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
-                        f"• <b>Live PnL ($1 Risk):</b> <code>{'+' if pnl_usd >= 0 else ''}${pnl_usd:.2f}</code> ({r_multiple:+.2f}R)\n"
-                        f"• <b>Outcome:</b> EOD SCRATCH/PARTIAL"
-                        f"{prop_box}"
-                    )
-                    self.notify(msg)
-                    self.state["active_trade"] = None
-                    self._save_state()
+        # Session Time Stop (15:55 ET for NY, 02:00 ET for Asia)
+        is_session_end = False
+        if session_tag == "NY" and curr_time >= dtime(15, 55):
+            is_session_end = True
+        elif session_tag == "ASIA" and dtime(2, 0) <= curr_time < dtime(3, 0):
+            is_session_end = True
+
+        if target_hit:
+            pnl_usd = self.risk_usd * 2.0
+            pts = self.target_pts
+            prop_res = self.prop_tracker.record_trade(
+                date_str=today_str, side=active["side"], entry_price=active["entry_price"],
+                exit_price=active["take_profit"], pts=pts, r_multiple=2.0, outcome="TARGET"
+            )
+            prop_box = self.prop_tracker.format_telegram_summary(prop_res)
+            msg = (
+                f"💰 <b>WEEX {self.symbol} [{session_tag}] TAKE PROFIT HIT (+2.0R)</b>\n"
+                f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
+                f"• <b>Live PnL ($1 Risk):</b> <code>+${pnl_usd:.2f}</code>\n"
+                f"• <b>Outcome:</b> WIN"
+                f"{prop_box}"
+            )
+            self.notify(msg)
+            self.state["active_trade"] = None
+            self._save_state()
+
+        elif stop_hit:
+            pnl_usd = -self.risk_usd
+            pts = -self.stop_pts
+            prop_res = self.prop_tracker.record_trade(
+                date_str=today_str, side=active["side"], entry_price=active["entry_price"],
+                exit_price=active["stop_loss"], pts=pts, r_multiple=-1.0, outcome="STOP"
+            )
+            prop_box = self.prop_tracker.format_telegram_summary(prop_res)
+            msg = (
+                f"🛑 <b>WEEX {self.symbol} [{session_tag}] STOP LOSS HIT (-1.0R)</b>\n"
+                f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
+                f"• <b>Live PnL ($1 Risk):</b> <code>-${self.risk_usd:.2f}</code>\n"
+                f"• <b>Outcome:</b> LOSS"
+                f"{prop_box}"
+            )
+            self.notify(msg)
+            self.state["active_trade"] = None
+            self._save_state()
+
+        elif is_session_end:
+            self.client.close_position_market(self.symbol, active["side"], active["quantity"])
+            diff = (current_price - active["entry_price"]) if active["side"] == "LONG" else (active["entry_price"] - current_price)
+            pnl_usd = round((diff / self.stop_pts) * self.risk_usd, 2)
+            r_multiple = round(diff / self.stop_pts, 2)
+            prop_res = self.prop_tracker.record_trade(
+                date_str=today_str, side=active["side"], entry_price=active["entry_price"],
+                exit_price=current_price, pts=diff, r_multiple=r_multiple, outcome="SESSION_END"
+            )
+            prop_box = self.prop_tracker.format_telegram_summary(prop_res)
+            msg = (
+                f"⏱ <b>WEEX {self.symbol} [{session_tag}] SESSION TIME STOP</b>\n"
+                f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
+                f"• <b>Live PnL ($1 Risk):</b> <code>{'+' if pnl_usd >= 0 else ''}${pnl_usd:.2f}</code> ({r_multiple:+.2f}R)\n"
+                f"• <b>Outcome:</b> SCRATCH/PARTIAL"
+                f"{prop_box}"
+            )
+            self.notify(msg)
+            self.state["active_trade"] = None
+            self._save_state()
 
 
 def main():
     cfg = load_config()
     bot = OrbTradingBot(cfg)
-    logger.info(f"Initialized WEEX NAS100 15m ORB Bot | Risk: ${cfg.get('risk_usd', 1.0)} | Dry-Run: {cfg.get('dry_run')}")
-    bot.notify("🤖 <b>WEEX NAS100 15m ORB Bot Online on DigitalOcean</b> ($1 Risk Micro Mode)")
+    logger.info(f"Initialized WEEX NAS100 Dual-Session (Asia + NY) ORB Bot | Risk: ${cfg.get('risk_usd', 1.0)}")
+    bot.notify("🤖 <b>WEEX NAS100 Dual-Session (Asia + NY) ORB Bot Online on DigitalOcean</b> ($1 Risk Micro Mode)")
 
     poll_sec = int(cfg.get("poll_interval_seconds", 5))
     while True:
