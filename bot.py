@@ -352,34 +352,54 @@ class OrbTradingBot:
             message
         )
 
-    def calculate_opening_range(self, start_h: int, start_m: int, end_h: int, end_m: int) -> Optional[Dict[str, float]]:
-        """Calculates OR High and Low between start and end time (NY timezone)."""
-        df = self.client.get_klines(self.symbol, interval="1m", limit=40)
-        if df is None or len(df) < 15:
-            return None
+    def calculate_opening_range(self, session: str) -> Optional[Dict[str, float]]:
+        """
+        Calculates OR High and Low for the given session (NY: 09:30-09:45 ET, ASIA: 20:00-20:15 ET).
+        Uses 15m candles directly for 100% reliability.
+        """
+        target_time = dtime(9, 30) if session == "NY" else dtime(20, 0)
+        
+        # 1. Fetch 15m klines from WEEX
+        df_15m = self.client.get_klines(self.symbol, interval="15m", limit=20)
+        if df_15m is not None and not df_15m.empty:
+            df_15m["time_ny"] = df_15m["open_time"].dt.tz_convert(NY_TZ)
+            today_date = datetime.now(NY_TZ).date()
+            for _, row in df_15m.iterrows():
+                row_dt = row["time_ny"]
+                if row_dt.date() == today_date and row_dt.time() == target_time:
+                    or_h = float(row["high"])
+                    or_l = float(row["low"])
+                    return {
+                        "high": or_h,
+                        "low": or_l,
+                        "range": round(or_h - or_l, 2)
+                    }
 
-        df["time_ny"] = df["open_time"].dt.tz_convert(NY_TZ)
-        today_date = datetime.now(NY_TZ).date()
+        # 2. Fallback to 1m klines if 15m candle hasn't indexed
+        start_h, start_m = (9, 30) if session == "NY" else (20, 0)
+        end_h, end_m = (9, 45) if session == "NY" else (20, 15)
+        df_1m = self.client.get_klines(self.symbol, interval="1m", limit=120)
+        if df_1m is not None and not df_1m.empty:
+            df_1m["time_ny"] = df_1m["open_time"].dt.tz_convert(NY_TZ)
+            today_date = datetime.now(NY_TZ).date()
+            t_start = dtime(start_h, start_m)
+            t_end = dtime(end_h, end_m)
+            mask = (
+                (df_1m["time_ny"].dt.date == today_date) &
+                (df_1m["time_ny"].dt.time >= t_start) &
+                (df_1m["time_ny"].dt.time < t_end)
+            )
+            or_df = df_1m[mask]
+            if len(or_df) >= 10:
+                or_h = float(or_df["high"].max())
+                or_l = float(or_df["low"].min())
+                return {
+                    "high": or_h,
+                    "low": or_l,
+                    "range": round(or_h - or_l, 2)
+                }
 
-        t_start = dtime(start_h, start_m)
-        t_end = dtime(end_h, end_m)
-
-        mask = (
-            (df["time_ny"].dt.date == today_date) &
-            (df["time_ny"].dt.time >= t_start) &
-            (df["time_ny"].dt.time < t_end)
-        )
-        or_df = df[mask]
-        if len(or_df) < 10:
-            return None
-
-        or_h = float(or_df["high"].max())
-        or_l = float(or_df["low"].min())
-        return {
-            "high": or_h,
-            "low": or_l,
-            "range": round(or_h - or_l, 2)
-        }
+        return None
 
     def run_cycle(self):
         now_ny = datetime.now(NY_TZ)
@@ -391,11 +411,11 @@ class OrbTradingBot:
         # =====================================================================
         if self.cfg.get("trade_asia", True):
             asia_session_key = f"{today_str}_ASIA"
-            # Establish Asia OR at 20:15 ET (20:00:00 to 20:14:59 ET)
-            if dtime(20, 15) <= curr_time < dtime(20, 16):
+            # Establish Asia OR any time after 20:15 ET up to 02:00 ET
+            if (curr_time >= dtime(20, 15) or curr_time < dtime(2, 0)):
                 orb_info = self.state.get("current_session_orb")
-                if not orb_info or orb_info.get("session") != "ASIA":
-                    orb = self.calculate_opening_range(20, 0, 20, 15)
+                if not orb_info or orb_info.get("session") != "ASIA" or orb_info.get("date") != today_str:
+                    orb = self.calculate_opening_range("ASIA")
                     if orb:
                         self.state["current_session_orb"] = {"session": "ASIA", "orb": orb, "date": today_str}
                         self._save_state()
@@ -413,7 +433,7 @@ class OrbTradingBot:
 
             # Check Asia Session Breakout trigger (20:15 ET to 02:00 ET)
             orb_info = self.state.get("current_session_orb")
-            if orb_info and orb_info.get("session") == "ASIA" and not self.state.get("session_trades", {}).get(asia_session_key) and self.state.get("active_trade") is None:
+            if orb_info and orb_info.get("session") == "ASIA" and orb_info.get("date") == today_str and not self.state.get("session_trades", {}).get(asia_session_key) and self.state.get("active_trade") is None:
                 if (curr_time >= dtime(20, 15) or curr_time < dtime(2, 0)):
                     self._check_and_execute_breakout("ASIA", asia_session_key, orb_info["orb"], now_ny)
 
@@ -422,11 +442,11 @@ class OrbTradingBot:
         # =====================================================================
         if self.cfg.get("trade_ny", True):
             ny_session_key = f"{today_str}_NY"
-            # Establish NY OR at 09:45 ET (09:30:00 to 09:44:59 ET)
-            if dtime(9, 45) <= curr_time < dtime(9, 46):
+            # Establish NY OR any time after 09:45 ET up to 15:50 ET (catchup resilient)
+            if dtime(9, 45) <= curr_time <= dtime(15, 50):
                 orb_info = self.state.get("current_session_orb")
-                if not orb_info or orb_info.get("session") != "NY":
-                    orb = self.calculate_opening_range(9, 30, 9, 45)
+                if not orb_info or orb_info.get("session") != "NY" or orb_info.get("date") != today_str:
+                    orb = self.calculate_opening_range("NY")
                     if orb:
                         self.state["current_session_orb"] = {"session": "NY", "orb": orb, "date": today_str}
                         self._save_state()
@@ -444,7 +464,7 @@ class OrbTradingBot:
 
             # Check NY Session Breakout trigger (09:45 ET to 15:00 ET)
             orb_info = self.state.get("current_session_orb")
-            if orb_info and orb_info.get("session") == "NY" and not self.state.get("session_trades", {}).get(ny_session_key) and self.state.get("active_trade") is None:
+            if orb_info and orb_info.get("session") == "NY" and orb_info.get("date") == today_str and not self.state.get("session_trades", {}).get(ny_session_key) and self.state.get("active_trade") is None:
                 if dtime(9, 45) <= curr_time <= dtime(15, 0):
                     self._check_and_execute_breakout("NY", ny_session_key, orb_info["orb"], now_ny)
 
