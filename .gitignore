@@ -3,6 +3,7 @@ __pycache__/
 .env
 config.json
 orb_state.json
+prop_account_state.json
 weex_nas100_orb.log
 *.log
 .pytest_cache/

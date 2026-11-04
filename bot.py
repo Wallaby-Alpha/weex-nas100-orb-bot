@@ -39,6 +39,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import requests
 import pandas as pd
 import pytz
+from prop_tracker import PropFirmTracker
 
 # Ensure UTF-8 output on all operating systems
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -338,6 +339,15 @@ class OrbTradingBot:
         self.risk_usd = float(config.get("risk_usd", 1.0))
         self.stop_pts = float(config.get("stop_loss_points", 25.0))
         self.target_pts = float(config.get("take_profit_points", 50.0))
+        self.prop_tracker = PropFirmTracker(
+            account_id="MFF_Flex_25K_Sim",
+            starting_balance=25000.0,
+            eval_target=1500.0,
+            max_trailing_dd=1000.0,
+            contracts=2,
+            pt_value=2.0,
+            commission_per_tr=4.50
+        )
         self.state: Dict[str, Any] = self._load_state()
 
     def _load_state(self) -> Dict[str, Any]:
@@ -526,11 +536,23 @@ class OrbTradingBot:
 
                 if target_hit:
                     pnl_usd = self.risk_usd * 2.0
+                    pts = self.target_pts
+                    prop_res = self.prop_tracker.record_trade(
+                        date_str=today_str,
+                        side=active["side"],
+                        entry_price=active["entry_price"],
+                        exit_price=active["take_profit"],
+                        pts=pts,
+                        r_multiple=2.0,
+                        outcome="TARGET"
+                    )
+                    prop_box = self.prop_tracker.format_telegram_summary(prop_res)
                     msg = (
                         f"💰 <b>WEEX {self.symbol} TAKE PROFIT HIT (+2.0R)</b>\n"
                         f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
-                        f"• <b>PnL:</b> <code>+${pnl_usd:.2f}</code>\n"
+                        f"• <b>Live PnL ($1 Risk):</b> <code>+${pnl_usd:.2f}</code>\n"
                         f"• <b>Outcome:</b> WIN"
+                        f"{prop_box}"
                     )
                     self.notify(msg)
                     self.state["active_trade"] = None
@@ -538,11 +560,23 @@ class OrbTradingBot:
 
                 elif stop_hit:
                     pnl_usd = -self.risk_usd
+                    pts = -self.stop_pts
+                    prop_res = self.prop_tracker.record_trade(
+                        date_str=today_str,
+                        side=active["side"],
+                        entry_price=active["entry_price"],
+                        exit_price=active["stop_loss"],
+                        pts=pts,
+                        r_multiple=-1.0,
+                        outcome="STOP"
+                    )
+                    prop_box = self.prop_tracker.format_telegram_summary(prop_res)
                     msg = (
                         f"🛑 <b>WEEX {self.symbol} STOP LOSS HIT (-1.0R)</b>\n"
                         f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
-                        f"• <b>PnL:</b> <code>-${self.risk_usd:.2f}</code>\n"
+                        f"• <b>Live PnL ($1 Risk):</b> <code>-${self.risk_usd:.2f}</code>\n"
                         f"• <b>Outcome:</b> LOSS"
+                        f"{prop_box}"
                     )
                     self.notify(msg)
                     self.state["active_trade"] = None
@@ -554,11 +588,22 @@ class OrbTradingBot:
                     diff = (current_price - active["entry_price"]) if active["side"] == "LONG" else (active["entry_price"] - current_price)
                     pnl_usd = round((diff / self.stop_pts) * self.risk_usd, 2)
                     r_multiple = round(diff / self.stop_pts, 2)
+                    prop_res = self.prop_tracker.record_trade(
+                        date_str=today_str,
+                        side=active["side"],
+                        entry_price=active["entry_price"],
+                        exit_price=current_price,
+                        pts=diff,
+                        r_multiple=r_multiple,
+                        outcome="EOD"
+                    )
+                    prop_box = self.prop_tracker.format_telegram_summary(prop_res)
                     msg = (
                         f"⏱ <b>WEEX {self.symbol} EOD TIME STOP (15:55 ET)</b>\n"
                         f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
-                        f"• <b>PnL:</b> <code>{'+' if pnl_usd >= 0 else ''}${pnl_usd:.2f}</code> ({r_multiple:+.2f}R)\n"
+                        f"• <b>Live PnL ($1 Risk):</b> <code>{'+' if pnl_usd >= 0 else ''}${pnl_usd:.2f}</code> ({r_multiple:+.2f}R)\n"
                         f"• <b>Outcome:</b> EOD SCRATCH/PARTIAL"
+                        f"{prop_box}"
                     )
                     self.notify(msg)
                     self.state["active_trade"] = None
