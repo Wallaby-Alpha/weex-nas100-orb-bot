@@ -150,19 +150,19 @@ class WeexClient:
         }
 
     def _load_exchange_info(self):
-        url = f"{self.base_url}/capi/v3/market/contracts"
+        url = f"{self.base_url}/capi/v3/market/exchangeInfo"
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
-                data = r.json().get("data", [])
+                data = r.json().get("symbols", [])
                 meta = {}
                 for s in data:
                     sym = s.get("symbol", "")
                     meta[sym] = {
                         "pricePrecision": int(s.get("pricePrecision", 2)),
-                        "quantityPrecision": int(s.get("quantityPrecision", 4)),
-                        "contractVal": float(s.get("contractVal", 0.0001)),
-                        "minOrderSize": float(s.get("minOrderSize", 0.0001)),
+                        "quantityPrecision": int(s.get("quantityPrecision", 2)),
+                        "contractVal": float(s.get("contractVal", 0.01)),
+                        "minOrderSize": float(s.get("minOrderSize", 0.01)),
                         "maxOrderSize": float(s.get("maxOrderSize", 100000000.0)),
                     }
                 self.exchange_info = meta
