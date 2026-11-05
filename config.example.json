@@ -4,11 +4,14 @@
   "passphrase": "",
   "dry_run": false,
   "symbol": "QQQUSDT",
+  "strategy_mode": "HYBRID",
   "risk_usd": 1.0,
-  "stop_loss_points": 1.0,
-  "take_profit_points": 2.0,
+  "continuation_stop_pts": 1.0,
+  "continuation_target_pts": 2.0,
+  "reversion_r": 1.5,
   "trade_asia": true,
   "trade_ny": true,
+  "poll_interval_seconds": 5,
   "telegram_bot_token": "",
   "telegram_chat_id": ""
 }

@@ -1,18 +1,13 @@
 """
 prop_tracker.py
 ---------------
-Real-Time Prop Firm Shadow Simulation Engine for MFF Flex 25K (or configurable).
+Real-Time Prop Firm Shadow Simulation Engine.
+Supports:
+1. MFF Rapid 50K (Code JJ: $80 eval, $0 activation, $3,000 target, $2,000 trailing DD, 90% payout split)
+2. MFF Flex 25K ($20 promo, $1,500 target, $1,000 trailing DD, 80% payout split)
 
-Automatically converts live $1 micro-trades (from WEEX NAS100) into realistic
-futures prop firm trades (e.g. 2 MNQ contracts, $100 risk per trade).
-
-Tracks:
-1. Balance & Equity progression
-2. End-of-Day (EOD) Trailing Drawdown Floor ($1,000 trailing buffer)
-3. 50% Consistency Rule compliance (no single day > 50% of total profit)
-4. Evaluation Target ($1,500) & Automatic promotion to SIM_FUNDED
-5. 5 Winning Days >= $100 requirement for 1st payout extraction
-6. Formatted Telegram report box ready for instant dispatch
+Automatically scales live $1.00 micro-trades on WEEX QQQUSDT into realistic
+futures prop firm trades (8 MNQ in Eval -> 4 MNQ in Funded).
 """
 
 import os
@@ -25,21 +20,27 @@ STATE_FILE = "prop_account_state.json"
 class PropFirmTracker:
     def __init__(
         self,
-        account_id: str = "MFF_Flex_25K_Sim",
-        starting_balance: float = 25000.0,
-        eval_target: float = 1500.0,
-        max_trailing_dd: float = 1000.0,
-        contracts: int = 2,           # 2 MNQ contracts
-        pt_value: float = 2.0,        # $2/pt per MNQ contract
-        commission_per_tr: float = 4.50
+        account_id: str = "MFF_Rapid_50K_Sim",
+        account_type: str = "MFF_RAPID_50K", # "MFF_RAPID_50K" or "MFF_FLEX_25K"
+        starting_balance: float = 50000.0,
+        eval_target: float = 3000.0,
+        max_trailing_dd: float = 2000.0,
+        eval_contracts: int = 8,       # 8 MNQ in Eval ($400 risk on 25 pt stop)
+        funded_contracts: int = 4,     # 4 MNQ in Funded ($200 risk on 25 pt stop)
+        pt_value: float = 2.0,         # $2/pt per MNQ
+        commission_per_tr: float = 4.50,
+        payout_split: float = 0.90     # 90% trader split on Rapid
     ):
         self.account_id = account_id
+        self.account_type = account_type
         self.starting_balance = starting_balance
         self.eval_target = eval_target
         self.max_trailing_dd = max_trailing_dd
-        self.contracts = contracts
+        self.eval_contracts = eval_contracts
+        self.funded_contracts = funded_contracts
         self.pt_value = pt_value
         self.commission_per_tr = commission_per_tr
+        self.payout_split = payout_split
         self.state = self._load_state()
 
     def _load_state(self) -> Dict[str, Any]:
@@ -51,14 +52,15 @@ class PropFirmTracker:
                 pass
         return {
             "account_id": self.account_id,
+            "account_type": self.account_type,
             "stage": "EVALUATION",  # EVALUATION -> SIM_FUNDED -> PAYOUT_READY -> BREACHED
             "current_balance": self.starting_balance,
-            "peak_eod_balance": self.starting_balance,
+            "peak_balance": self.starting_balance,
             "dd_floor": self.starting_balance - self.max_trailing_dd,
             "total_trades": 0,
             "wins": 0,
             "losses": 0,
-            "winning_days_100": 0,
+            "winning_days_qualifier": 0,
             "daily_history": {},     # "YYYY-MM-DD": net_pnl
             "trades": []
         }
@@ -80,13 +82,16 @@ class PropFirmTracker:
         r_multiple: float,
         outcome: str
     ) -> Dict[str, Any]:
-        """
-        Calculates simulated PnL based on 2 MNQ contracts.
-        2 MNQ: 1 point = $4.00 gross ($2.00 * 2).
-        25 pt stop = -$100 gross. 50 pt target = +$200 gross.
-        """
-        gross_pnl = pts * (self.pt_value * self.contracts)
-        net_pnl = gross_pnl - self.commission_per_tr
+        # Determine contracts based on current stage
+        is_eval = (self.state["stage"] == "EVALUATION")
+        contracts = self.eval_contracts if is_eval else self.funded_contracts
+        
+        # Calculate simulated MNQ PnL
+        # Normalize QQQ pts to NQ pts (ratio ~40:1, so 1 pt on QQQ = ~40 pts on NQ)
+        # Or standard R multiple: risk is $400 on eval (8 MNQ), $200 on funded (4 MNQ)
+        base_risk = 400.0 if is_eval else 200.0
+        gross_pnl = r_multiple * base_risk
+        net_pnl = gross_pnl - (self.commission_per_tr * (contracts / 2.0))
 
         # Update balance
         prev_balance = self.state["current_balance"]
@@ -103,11 +108,11 @@ class PropFirmTracker:
         day_pnl = self.state["daily_history"].get(date_str, 0.0) + net_pnl
         self.state["daily_history"][date_str] = round(day_pnl, 2)
 
-        # Update EOD Trailing Floor (MFF Flex: trails highest EOD balance)
-        if new_balance > self.state["peak_eod_balance"]:
-            self.state["peak_eod_balance"] = round(new_balance, 2)
-            # In funded stage, MLL often locks at starting balance + $100
+        # Update Trailing DD Floor
+        if new_balance > self.state["peak_balance"]:
+            self.state["peak_balance"] = round(new_balance, 2)
             new_floor = new_balance - self.max_trailing_dd
+            # In funded stage, floor locks at starting balance + $100 buffer
             if self.state["stage"] == "SIM_FUNDED" and new_floor > (self.starting_balance + 100.0):
                 new_floor = self.starting_balance + 100.0
             self.state["dd_floor"] = round(new_floor, 2)
@@ -119,17 +124,22 @@ class PropFirmTracker:
         # Check Evaluation Target
         profit_from_start = new_balance - self.starting_balance
         if self.state["stage"] == "EVALUATION" and profit_from_start >= self.eval_target:
-            # Check 50% consistency rule: max day <= 50% of total profit
+            # 50% consistency rule
             max_day = max(self.state["daily_history"].values()) if self.state["daily_history"] else 0.0
             consistency_ratio = (max_day / profit_from_start) if profit_from_start > 0 else 1.0
             if consistency_ratio <= 0.50:
                 self.state["stage"] = "SIM_FUNDED"
+                self.state["peak_balance"] = new_balance
+                self.state["dd_floor"] = new_balance - self.max_trailing_dd
 
-        # Check Funded Winning Days (Days with >= +$100 profit)
+        # Check Funded Winning Days ($150+ threshold on 50k, $100 on 25k)
+        min_win_day = 150.0 if self.account_type == "MFF_RAPID_50K" else 100.0
+        min_payout_bal = 2000.0 if self.account_type == "MFF_RAPID_50K" else 1000.0
+        
         if self.state["stage"] == "SIM_FUNDED":
-            winning_days = sum(1 for p in self.state["daily_history"].values() if p >= 100.0)
-            self.state["winning_days_100"] = winning_days
-            if winning_days >= 5 and profit_from_start >= 1000.0:
+            winning_days = sum(1 for p in self.state["daily_history"].values() if p >= min_win_day)
+            self.state["winning_days_qualifier"] = winning_days
+            if winning_days >= 5 and profit_from_start >= min_payout_bal:
                 self.state["stage"] = "PAYOUT_READY"
 
         self.state["trades"].append({
@@ -141,7 +151,8 @@ class PropFirmTracker:
             "r_multiple": r_multiple,
             "net_pnl": round(net_pnl, 2),
             "balance_after": round(new_balance, 2),
-            "outcome": outcome
+            "outcome": outcome,
+            "stage": self.state["stage"]
         })
 
         self._save_state()
@@ -162,26 +173,26 @@ class PropFirmTracker:
         stage = trade_summary["stage"]
         profit = trade_summary["profit_from_start"]
         
-        # Target progress bar
         if stage == "EVALUATION":
             pct = min(100.0, max(0.0, (profit / self.eval_target) * 100.0))
             filled = int(pct / 10)
             bar = "█" * filled + "░" * (10 - filled)
             stage_str = f"🎯 <b>EVALUATION PROGRESS:</b> <code>[{bar}] {pct:.1f}%</code>\n• <b>Target:</b> <code>${profit:+,.2f} / ${self.eval_target:,.2f}</code>"
         elif stage == "SIM_FUNDED":
-            w_days = self.state.get("winning_days_100", 0)
-            stage_str = f"💼 <b>SIM_FUNDED ACTIVE</b>\n• <b>Payout Qualifier:</b> <code>{w_days} / 5 Winning Days >= $100</code>"
+            w_days = self.state.get("winning_days_qualifier", 0)
+            stage_str = f"💼 <b>SIM_FUNDED ACTIVE</b>\n• <b>Payout Qualifier:</b> <code>{w_days} / 5 Winning Days</code>"
         elif stage == "PAYOUT_READY":
-            stage_str = f"🏆 <b>PAYOUT ELIGIBLE! ($1,000+ Available)</b>"
+            avail = (balance - self.starting_balance) * 0.50 * self.payout_split
+            stage_str = f"🏆 <b>PAYOUT READY! (Est. Cash: ~${avail:,.2f} at {int(self.payout_split*100)}% Split)</b>"
         else:
             stage_str = f"❌ <b>ACCOUNT BREACHED (MAX DD EXCEEDED)</b>"
 
         box = (
             f"\n───────────────────────────\n"
-            f"🏛 <b>SHADOW PROP FIRM (MFF Flex 25K)</b>\n"
-            f"• <b>Sim Trade (2 MNQ):</b> <code>{'+' if net_pnl >= 0 else ''}${net_pnl:,.2f}</code>\n"
-            f"• <b>Account Balance:</b> <code>${balance:,.2f}</code>\n"
-            f"• <b>Trailing DD Floor:</b> <code>${self.state['dd_floor']:,.2f}</code> (Buffer: <code>${buffer_val:,.2f}</code>)\n"
+            f"🏛 <b>SHADOW PROP FIRM ({self.account_id})</b>\n"
+            f"• <b>Sim PnL:</b> <code>{'+' if net_pnl >= 0 else ''}${net_pnl:,.2f}</code>\n"
+            f"• <b>Sim Balance:</b> <code>${balance:,.2f}</code>\n"
+            f"• <b>Trailing Floor:</b> <code>${self.state['dd_floor']:,.2f}</code> (Buffer: <code>${buffer_val:,.2f}</code>)\n"
             f"{stage_str}"
         )
         return box
