@@ -2,7 +2,7 @@
   "api_key": "",
   "secret_key": "",
   "passphrase": "",
-  "dry_run": false,
+  "dry_run": true,
   "symbol": "QQQUSDT",
   "strategy_mode": "HYBRID",
   "risk_usd": 1.0,

@@ -2,7 +2,7 @@
 weex-nas100-orb-bot / bot.py
 ----------------------------
 Dual-Engine (Continuation 2.0R + Mean Reversion 1.5R) Trading Bot for WEEX QQQUSDT.
-Executes JJ Simon's Syndicate Model on live micro-capital ($1.00 risk):
+Executes JJ Simon's Syndicate Model on live market data with Pure Paper / Simulation Mode:
 
 Two Core Strategy Engines:
 1. Channel A: 1-Minute Continuation (2.0R Target)
@@ -19,9 +19,10 @@ Modes Supported:
 - "REVERSION": Exclusively trades 5m Failed Auction Reclaim @ 1.5R.
 
 Core Features:
-- Micro-Risk Sizing: Exactly $1.00 USD risk per trade on WEEX contracts.
+- 100% Pure Paper Trading & Data Collection: Runs seamlessly without placing live exchange orders, zero API key/KYC friction.
 - Shadow Prop Firm Tracker: Simulates a $50K MFF Rapid account (8 MNQ Eval -> 4 MNQ Funded, 90% split).
-- Telegram Broadcasts: Instant order fill alerts with strategy tags (🚀 Continuation vs 🧲 Reversion).
+- Persistent CSV Ledger: Saves every trade and fill to `paper_trades.csv`.
+- Real-Time Telegram Broadcasts: Instant alerts for OR setup, paper entry fills, and TP/SL exits.
 """
 
 import os
@@ -31,6 +32,7 @@ import time
 import hmac
 import hashlib
 import base64
+import csv
 import logging
 from pathlib import Path
 from datetime import datetime, time as dtime
@@ -61,6 +63,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 EXAMPLE_CONFIG_PATH = SCRIPT_DIR / "config.example.json"
 STATE_FILE = SCRIPT_DIR / "orb_state.json"
+PAPER_TRADES_CSV = SCRIPT_DIR / "paper_trades.csv"
 
 NY_TZ = pytz.timezone("America/New_York")
 
@@ -70,7 +73,7 @@ def load_config() -> Dict[str, Any]:
         "api_key": os.environ.get("WEEX_API_KEY", ""),
         "secret_key": os.environ.get("WEEX_SECRET_KEY", ""),
         "passphrase": os.environ.get("WEEX_PASSPHRASE", ""),
-        "dry_run": False,
+        "dry_run": True, # Default to True (Pure Paper Simulation)
         "symbol": "QQQUSDT",
         "strategy_mode": "HYBRID", # "HYBRID", "CONTINUATION", "REVERSION"
         "risk_usd": 1.0,
@@ -118,7 +121,7 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 
 
 class WeexClient:
-    def __init__(self, api_key: str, secret_key: str, passphrase: str, dry_run: bool = False):
+    def __init__(self, api_key: str, secret_key: str, passphrase: str, dry_run: bool = True):
         self.api_key = api_key
         self.secret_key = secret_key
         self.passphrase = passphrase
@@ -209,12 +212,12 @@ class WeexClient:
     def calculate_micro_qty(self, symbol: str, risk_usd: float, stop_points: float) -> Tuple[float, str]:
         info = self.exchange_info.get(symbol, {
             "pricePrecision": 2,
-            "quantityPrecision": 4,
-            "contractVal": 0.0001,
-            "minOrderSize": 0.0001
+            "quantityPrecision": 2,
+            "contractVal": 0.01,
+            "minOrderSize": 0.01
         })
-        prec = info.get("quantityPrecision", 4)
-        min_size = info.get("minOrderSize", 0.0001)
+        prec = info.get("quantityPrecision", 2)
+        min_size = info.get("minOrderSize", 0.01)
 
         raw_qty = risk_usd / stop_points
         qty = max(min_size, raw_qty)
@@ -230,19 +233,20 @@ class WeexClient:
         stop_loss: float,
         take_profit: float
     ) -> Dict[str, Any]:
-        info = self.exchange_info.get(symbol, {"pricePrecision": 2, "quantityPrecision": 4})
+        info = self.exchange_info.get(symbol, {"pricePrecision": 2, "quantityPrecision": 2})
         p_prec = info.get("pricePrecision", 2)
-        q_prec = info.get("quantityPrecision", 4)
+        q_prec = info.get("quantityPrecision", 2)
 
         qty_str = f"{quantity:.{q_prec}f}"
         sl_str = f"{stop_loss:.{p_prec}f}"
         tp_str = f"{take_profit:.{p_prec}f}"
 
+        # In Paper Mode / Dry Run: zero API friction
         if self.dry_run:
-            logger.info(f"[DRY-RUN] Place Order: {symbol} {side} {position_side} Qty={qty_str} SL={sl_str} TP={tp_str}")
+            logger.info(f"[PAPER SIMULATION] Simulated Order: {symbol} {side} {position_side} Qty={qty_str} SL={sl_str} TP={tp_str}")
             return {
                 "status": "dry_run_success",
-                "orderId": f"dry_{int(time.time()*1000)}",
+                "orderId": f"paper_{int(time.time()*1000)}",
                 "quantity": qty_str,
                 "stop_loss": sl_str,
                 "take_profit": tp_str
@@ -287,12 +291,12 @@ class WeexClient:
 
     def close_position_market(self, symbol: str, position_side: str, quantity: float) -> Dict[str, Any]:
         side = "SELL" if position_side.upper() == "LONG" else "BUY"
-        info = self.exchange_info.get(symbol, {"quantityPrecision": 4})
-        qty_str = f"{quantity:.{info.get('quantityPrecision', 4)}f}"
+        info = self.exchange_info.get(symbol, {"quantityPrecision": 2})
+        qty_str = f"{quantity:.{info.get('quantityPrecision', 2)}f}"
 
         if self.dry_run:
-            logger.info(f"[DRY-RUN] Close Market Position: {symbol} {side} {position_side} Qty={qty_str}")
-            return {"status": "dry_run_success", "orderId": f"dry_close_{int(time.time()*1000)}"}
+            logger.info(f"[PAPER SIMULATION] Close Position: {symbol} {side} {position_side} Qty={qty_str}")
+            return {"status": "dry_run_success", "orderId": f"paper_close_{int(time.time()*1000)}"}
 
         path = "/capi/v3/order"
         payload = {
@@ -327,14 +331,15 @@ class OrbTradingBot:
             api_key=config.get("api_key", ""),
             secret_key=config.get("secret_key", ""),
             passphrase=config.get("passphrase", ""),
-            dry_run=config.get("dry_run", False)
+            dry_run=config.get("dry_run", True)
         )
         self.symbol = config.get("symbol", "QQQUSDT")
-        self.strategy_mode = config.get("strategy_mode", "HYBRID").upper() # "HYBRID", "CONTINUATION", "REVERSION"
+        self.strategy_mode = config.get("strategy_mode", "HYBRID").upper()
         self.risk_usd = float(config.get("risk_usd", 1.0))
         self.cont_stop_pts = float(config.get("continuation_stop_pts", 1.0))
         self.cont_target_pts = float(config.get("continuation_target_pts", 2.0))
-        self.reversion_r = float(config.get("reversion_r", 1.5)) # JJ Simon 1.5R target
+        self.reversion_r = float(config.get("reversion_r", 1.5))
+        self.dry_run = bool(config.get("dry_run", True))
         
         # Prop Firm Shadow Tracker (Simulates MFF Rapid 50K)
         self.prop_tracker = PropFirmTracker(
@@ -350,6 +355,48 @@ class OrbTradingBot:
             payout_split=0.90
         )
         self.state: Dict[str, Any] = self._load_state()
+        self._init_csv_ledger()
+
+    def _init_csv_ledger(self):
+        if not PAPER_TRADES_CSV.exists():
+            try:
+                with open(PAPER_TRADES_CSV, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "timestamp", "date", "session", "symbol", "strategy_type", "side",
+                        "entry_time", "exit_time", "entry_price", "exit_price",
+                        "stop_loss", "take_profit", "pts", "r_multiple", "pnl_usd",
+                        "outcome", "prop_sim_balance", "prop_sim_stage"
+                    ])
+            except Exception as e:
+                logger.error(f"Failed to init CSV ledger: {e}")
+
+    def _log_trade_to_csv(self, trade_record: Dict[str, Any]):
+        try:
+            with open(PAPER_TRADES_CSV, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    trade_record.get("date", ""),
+                    trade_record.get("session", ""),
+                    trade_record.get("symbol", ""),
+                    trade_record.get("type", ""),
+                    trade_record.get("side", ""),
+                    trade_record.get("entry_time", ""),
+                    trade_record.get("exit_time", ""),
+                    trade_record.get("entry_price", ""),
+                    trade_record.get("exit_price", ""),
+                    trade_record.get("stop_loss", ""),
+                    trade_record.get("take_profit", ""),
+                    trade_record.get("pts", ""),
+                    trade_record.get("r_multiple", ""),
+                    trade_record.get("pnl_usd", ""),
+                    trade_record.get("outcome", ""),
+                    trade_record.get("prop_balance", ""),
+                    trade_record.get("prop_stage", "")
+                ])
+        except Exception as e:
+            logger.error(f"Failed to write to CSV ledger: {e}")
 
     def _load_state(self) -> Dict[str, Any]:
         if STATE_FILE.exists():
@@ -466,48 +513,43 @@ class OrbTradingBot:
 
     def _broadcast_or_established(self, session_tag: str, orb: Dict[str, float]):
         icon = "🌏" if session_tag == "ASIA" else "🗽"
+        mode_prefix = "🧪 <b>[PAPER SIMULATION]</b>\n" if self.dry_run else ""
         msg = (
-            f"{icon} <b>WEEX {self.symbol} [{session_tag}] 15m Range Established</b>\n"
+            f"{mode_prefix}{icon} <b>WEEX {self.symbol} [{session_tag}] 15m Range Established</b>\n"
             f"• <b>Strategy Mode:</b> <code>{self.strategy_mode}</code>\n"
             f"• <b>OR High:</b> <code>{orb['high']:.2f}</code>\n"
             f"• <b>OR Low:</b> <code>{orb['low']:.2f}</code> (Span: <code>{orb['range']:.2f} pts</code>)\n"
             f"• <b>Micro Risk:</b> <code>${self.risk_usd:.2f}</code>\n"
             f"• <b>Continuation Rule:</b> 1m Breakout @ <code>{self.cont_target_pts:.1f} pts (2.0R)</code>\n"
             f"• <b>Reversion Rule:</b> 5m Reclaim @ <code>1.5R (JJ Simon Target)</code>\n"
-            f"<i>Scanning session for triggers...</i>"
+            f"<i>Scanning live market for triggers...</i>"
         )
         self.notify(msg)
 
     def _evaluate_setups(self, session_tag: str, session_key: str, orb: Dict[str, float], now_ny: datetime):
         curr_time = now_ny.time()
         
-        # Determine Phase: Phase A (First 30m of post-OR) vs Phase B (Remainder)
-        # NY Phase A: 09:45 to 10:15 ET. Phase B: 10:15 to 15:00 ET.
-        # Asia Phase A: 20:15 to 20:45 ET. Phase B: 20:45 to 02:00 ET.
         is_phase_a = False
         if session_tag == "NY" and dtime(9, 45) <= curr_time < dtime(10, 15):
             is_phase_a = True
         elif session_tag == "ASIA" and dtime(20, 15) <= curr_time < dtime(20, 45):
             is_phase_a = True
 
-        # Check 1: CONTINUATION (Allowed in Phase A if HYBRID, or anytime if CONTINUATION mode)
         can_trade_cont = (self.strategy_mode == "CONTINUATION") or (self.strategy_mode == "HYBRID" and is_phase_a)
         if can_trade_cont:
             if self._check_continuation_trigger(session_tag, session_key, orb, now_ny):
                 return
 
-        # Check 2: MEAN REVERSION (Allowed in Phase B if HYBRID, or anytime if REVERSION mode)
         can_trade_rev = (self.strategy_mode == "REVERSION") or (self.strategy_mode == "HYBRID" and not is_phase_a)
         if can_trade_rev:
             self._check_reversion_trigger(session_tag, session_key, orb, now_ny)
 
     def _check_continuation_trigger(self, session_tag: str, session_key: str, orb: Dict[str, float], now_ny: datetime) -> bool:
-        """Evaluates 1m candle close breakout outside Opening Range."""
         df_1m = self.client.get_klines(self.symbol, interval="1m", limit=5)
         if df_1m is None or len(df_1m) < 2:
             return False
 
-        last_closed = df_1m.iloc[-2] # Last fully closed 1m candle
+        last_closed = df_1m.iloc[-2]
         close_p = float(last_closed["close"])
 
         # 1m Long Breakout
@@ -539,7 +581,6 @@ class OrbTradingBot:
         return False
 
     def _check_reversion_trigger(self, session_tag: str, session_key: str, orb: Dict[str, float], now_ny: datetime) -> bool:
-        """Evaluates 5m Failed Auction Reclaim: Pokes outside, closes BACK INSIDE."""
         df_5m = self.client.get_klines(self.symbol, interval="5m", limit=6)
         if df_5m is None or len(df_5m) < 2:
             return False
@@ -552,10 +593,9 @@ class OrbTradingBot:
         # Sweep High -> Close Back Below OR High -> SHORT REVERSION
         if high_5m > orb["high"] and close_5m <= orb["high"]:
             entry_p = self.client.get_latest_price(self.symbol) or close_5m
-            # Extreme wick + 0.15 pt buffer
             stop_dist = max(0.60, min(1.50, (high_5m - entry_p) + 0.15))
             sl = entry_p + stop_dist
-            tp = entry_p - (stop_dist * self.reversion_r) # 1.5R Target
+            tp = entry_p - (stop_dist * self.reversion_r)
             qty, qty_str = self.client.calculate_micro_qty(self.symbol, self.risk_usd, stop_dist)
             res = self.client.place_order_with_brackets(self.symbol, "SELL", "SHORT", qty, sl, tp)
             if res.get("status") in ["success", "dry_run_success"]:
@@ -569,7 +609,7 @@ class OrbTradingBot:
             entry_p = self.client.get_latest_price(self.symbol) or close_5m
             stop_dist = max(0.60, min(1.50, (entry_p - low_5m) + 0.15))
             sl = entry_p - stop_dist
-            tp = entry_p + (stop_dist * self.reversion_r) # 1.5R Target
+            tp = entry_p + (stop_dist * self.reversion_r)
             qty, qty_str = self.client.calculate_micro_qty(self.symbol, self.risk_usd, stop_dist)
             res = self.client.place_order_with_brackets(self.symbol, "BUY", "LONG", qty, sl, tp)
             if res.get("status") in ["success", "dry_run_success"]:
@@ -592,7 +632,8 @@ class OrbTradingBot:
             "quantity": qty,
             "target_r": target_r,
             "stop_dist": abs(entry_p - sl),
-            "entry_time": now_ny.strftime("%H:%M:%S")
+            "entry_time": now_ny.strftime("%H:%M:%S"),
+            "date": now_ny.strftime("%Y-%m-%d")
         }
         if "session_trades" not in self.state:
             self.state["session_trades"] = {}
@@ -600,8 +641,9 @@ class OrbTradingBot:
         self._save_state()
 
         icon = "🚀" if stype == "CONTINUATION" else "🧲"
+        mode_prefix = "🧪 <b>[PAPER SIMULATION]</b>\n" if self.dry_run else ""
         msg = (
-            f"{icon} <b>WEEX {self.symbol} [{session_tag}] {stype} {side} Fill</b>\n"
+            f"{mode_prefix}{icon} <b>WEEX {self.symbol} [{session_tag}] {stype} {side} Fill</b>\n"
             f"• <b>Entry:</b> <code>{entry_p:.2f}</code>\n"
             f"• <b>Stop Loss:</b> <code>{sl:.2f}</code> (-${self.risk_usd:.2f})\n"
             f"• <b>Take Profit:</b> <code>{tp:.2f}</code> (+${self.risk_usd * target_r:.2f} | {target_r:.1f}R)\n"
@@ -650,10 +692,23 @@ class OrbTradingBot:
                 r_multiple=target_r, outcome="TARGET"
             )
             prop_box = self.prop_tracker.format_telegram_summary(prop_res)
+            
+            # Log to CSV
+            self._log_trade_to_csv({
+                "date": today_str, "session": session_tag, "symbol": self.symbol,
+                "type": stype, "side": active["side"], "entry_time": active.get("entry_time", ""),
+                "exit_time": now_ny.strftime("%H:%M:%S"), "entry_price": active["entry_price"],
+                "exit_price": active["take_profit"], "stop_loss": active["stop_loss"],
+                "take_profit": active["take_profit"], "pts": active["stop_dist"] * target_r,
+                "r_multiple": target_r, "pnl_usd": pnl_usd, "outcome": "TARGET_WIN",
+                "prop_balance": prop_res["new_balance"], "prop_stage": prop_res["stage"]
+            })
+            
+            mode_prefix = "🧪 <b>[PAPER SIMULATION]</b>\n" if self.dry_run else ""
             msg = (
-                f"💰 <b>WEEX {self.symbol} [{session_tag}] {stype} TAKE PROFIT HIT (+{target_r:.1f}R)</b>\n"
+                f"{mode_prefix}💰 <b>WEEX {self.symbol} [{session_tag}] {stype} TAKE PROFIT HIT (+{target_r:.1f}R)</b>\n"
                 f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
-                f"• <b>Live Micro PnL ($1 Risk):</b> <code>+${pnl_usd:.2f}</code>\n"
+                f"• <b>Sim PnL ($1 Risk):</b> <code>+${pnl_usd:.2f}</code>\n"
                 f"• <b>Outcome:</b> WIN"
                 f"{prop_box}"
             )
@@ -669,10 +724,23 @@ class OrbTradingBot:
                 r_multiple=-1.0, outcome="STOP"
             )
             prop_box = self.prop_tracker.format_telegram_summary(prop_res)
+            
+            # Log to CSV
+            self._log_trade_to_csv({
+                "date": today_str, "session": session_tag, "symbol": self.symbol,
+                "type": stype, "side": active["side"], "entry_time": active.get("entry_time", ""),
+                "exit_time": now_ny.strftime("%H:%M:%S"), "entry_price": active["entry_price"],
+                "exit_price": active["stop_loss"], "stop_loss": active["stop_loss"],
+                "take_profit": active["take_profit"], "pts": -active["stop_dist"],
+                "r_multiple": -1.0, "pnl_usd": pnl_usd, "outcome": "STOP_LOSS",
+                "prop_balance": prop_res["new_balance"], "prop_stage": prop_res["stage"]
+            })
+            
+            mode_prefix = "🧪 <b>[PAPER SIMULATION]</b>\n" if self.dry_run else ""
             msg = (
-                f"🛑 <b>WEEX {self.symbol} [{session_tag}] {stype} STOP LOSS HIT (-1.0R)</b>\n"
+                f"{mode_prefix}🛑 <b>WEEX {self.symbol} [{session_tag}] {stype} STOP LOSS HIT (-1.0R)</b>\n"
                 f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
-                f"• <b>Live Micro PnL ($1 Risk):</b> <code>-${self.risk_usd:.2f}</code>\n"
+                f"• <b>Sim PnL ($1 Risk):</b> <code>-${self.risk_usd:.2f}</code>\n"
                 f"• <b>Outcome:</b> LOSS"
                 f"{prop_box}"
             )
@@ -690,10 +758,23 @@ class OrbTradingBot:
                 exit_price=current_price, pts=diff, r_multiple=r_multiple, outcome="SESSION_END"
             )
             prop_box = self.prop_tracker.format_telegram_summary(prop_res)
+            
+            # Log to CSV
+            self._log_trade_to_csv({
+                "date": today_str, "session": session_tag, "symbol": self.symbol,
+                "type": stype, "side": active["side"], "entry_time": active.get("entry_time", ""),
+                "exit_time": now_ny.strftime("%H:%M:%S"), "entry_price": active["entry_price"],
+                "exit_price": current_price, "stop_loss": active["stop_loss"],
+                "take_profit": active["take_profit"], "pts": diff,
+                "r_multiple": r_multiple, "pnl_usd": pnl_usd, "outcome": "TIME_EXIT",
+                "prop_balance": prop_res["new_balance"], "prop_stage": prop_res["stage"]
+            })
+            
+            mode_prefix = "🧪 <b>[PAPER SIMULATION]</b>\n" if self.dry_run else ""
             msg = (
-                f"⏱ <b>WEEX {self.symbol} [{session_tag}] {stype} SESSION TIME STOP</b>\n"
+                f"{mode_prefix}⏱ <b>WEEX {self.symbol} [{session_tag}] {stype} SESSION TIME STOP</b>\n"
                 f"• <b>Exit Price:</b> <code>{current_price:.2f}</code>\n"
-                f"• <b>Live Micro PnL ($1 Risk):</b> <code>{'+' if pnl_usd >= 0 else ''}${pnl_usd:.2f}</code> ({r_multiple:+.2f}R)\n"
+                f"• <b>Sim PnL ($1 Risk):</b> <code>{'+' if pnl_usd >= 0 else ''}${pnl_usd:.2f}</code> ({r_multiple:+.2f}R)\n"
                 f"• <b>Outcome:</b> SCRATCH/PARTIAL"
                 f"{prop_box}"
             )
@@ -705,13 +786,14 @@ class OrbTradingBot:
 def main():
     cfg = load_config()
     bot = OrbTradingBot(cfg)
-    logger.info(f"Initialized WEEX Dual-Engine Syndicate Bot on {cfg.get('symbol', 'QQQUSDT')} | Mode: {cfg.get('strategy_mode', 'HYBRID')}")
+    logger.info(f"Initialized WEEX Dual-Engine Bot | Symbol: {cfg.get('symbol', 'QQQUSDT')} | Paper Mode: {bot.dry_run}")
     bot.notify(
-        f"🤖 <b>WEEX QQQ Dual-Engine Syndicate Bot Online</b>\n"
+        f"🧪 <b>WEEX QQQ Live Paper Trading & Data Collector Online</b>\n"
+        f"• <b>Mode:</b> <code>100% Paper Simulation (No Order Placement)</code>\n"
         f"• <b>Symbol:</b> <code>{cfg.get('symbol', 'QQQUSDT')}</code>\n"
-        f"• <b>Mode:</b> <code>{cfg.get('strategy_mode', 'HYBRID')}</code> (Continuation 2.0R + Reversion 1.5R)\n"
-        f"• <b>Micro Risk:</b> <code>${cfg.get('risk_usd', 1.0):.2f}</code>\n"
-        f"• <b>Prop Shadow:</b> <code>MFF Rapid 50K (Code JJ | 90% Split)</code>"
+        f"• <b>Strategy:</b> <code>{cfg.get('strategy_mode', 'HYBRID')}</code> (1m Continuation @ 2.0R + 5m Reversion @ 1.5R)\n"
+        f"• <b>Shadow Prop Tracker:</b> <code>MFF Rapid 50K (Code JJ | 90% Split)</code>\n"
+        f"• <b>Data Persistence:</b> <code>paper_trades.csv</code>"
     )
 
     poll_sec = int(cfg.get("poll_interval_seconds", 5))
