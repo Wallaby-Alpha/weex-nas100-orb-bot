@@ -99,6 +99,10 @@ def load_config() -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"Error reading {c}: {e}")
 
+    # Enforce 100% Paper Simulation by default (safeguard against accidental exchange orders)
+    if not default_cfg.get("live_trading_armed", False):
+        default_cfg["dry_run"] = True
+
     return default_cfg
 
 
